@@ -7,13 +7,22 @@ Runs a single combined refresh cycle on one interval:
   STEP 2 — FIDS   (Aerodatabox live window) → flights_raw
   STEP 3 — Feature build pass 1            → featured_muc_rxn_wx3
   STEP 4 — Feature build pass 2            → featured_muc_rxn_wx3_fe
-  STEP 5 — Flight Status API               → flight_status_live
-  STEP 6 — Delay Analytics Snapshot        → flight_delay_snapshots (upsert)
+  STEP 5 — Batch ML Predictions            → flight_predictions   ← ADDED
+  STEP 6 — Flight Status API               → flight_status_live
+  STEP 7 — Delay Analytics Snapshot        → flight_delay_snapshots (upsert)
 
-Running FIDS and Flight Status in the SAME cycle guarantees that
-confirmed_delay_min and dep/arr_best_utc always refer to the same
-point in time, eliminating the "times match but delay shows" contradiction
-caused by the two APIs being on different refresh schedules.
+WHY STEP 5 EXISTS:
+  The original cycle rebuilt feature tables (Steps 3–4) but never re-ran
+  the CatBoost models afterwards. This meant flight_predictions stayed at
+  startup values while featured_muc_rxn_wx3_fe was refreshed every 30 min —
+  the API's /flights JOIN was serving stale ML scores against fresh features.
+
+  Step 5 calls run_batch_predictions() immediately after the feature tables
+  are ready and before Flight Status ingestion, so:
+    - /predict/from-db always reads current-cycle scores
+    - flight_delay_snapshots (Step 7) resolve against fresh ML minutes
+    - confirmed_delay_min (Step 6) enriches the same flight rows the model
+      just scored, maintaining a consistent per-cycle timestamp
 
 Interval (configurable):
   REFRESH_INTERVAL_MINUTES   default: 30
@@ -38,9 +47,6 @@ from sqlalchemy import create_engine, text
 logger = logging.getLogger(__name__)
 
 # ── Single shared interval ────────────────────────────────────────────────────
-# Both FIDS and Flight Status run together every REFRESH_INTERVAL_MINUTES.
-# Default 30 min: short enough to catch delays early, long enough to stay
-# within API rate limits for both Aerodatabox FIDS and Flight Status endpoints.
 _interval_cache_checked_at = 0.0
 _interval_cache_value_sec: Optional[int] = None
 _settings_engine = None
@@ -49,12 +55,12 @@ _log_lock = None
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _state = {
-    "last_ran":    None,   # datetime UTC of last successful full cycle
+    "last_ran":    None,
     "running":     False,
     "last_error":  None,
-    # Step-level last-ran (useful for /health endpoint)
-    "fids_last_ran":   None,
-    "status_last_ran": None,
+    "fids_last_ran":        None,
+    "predictions_last_ran": None,   # NEW — tracks when batch predictions last ran
+    "status_last_ran":      None,
 }
 
 
@@ -71,7 +77,6 @@ def append_pipeline_log(entry: dict) -> None:
     global _log_lock
     if _log_lock is None:
         _log_lock = threading.Lock()
-
     with _log_lock:
         _pipeline_log.append(dict(entry))
         while len(_pipeline_log) > 50:
@@ -82,15 +87,9 @@ def get_pipeline_log() -> list:
     global _log_lock
     if _log_lock is None:
         _log_lock = threading.Lock()
-
     with _log_lock:
         logs = [dict(entry) for entry in _pipeline_log]
-
-    return sorted(
-        logs,
-        key=lambda entry: entry.get("timestamp", ""),
-        reverse=True,
-    )
+    return sorted(logs, key=lambda e: e.get("timestamp", ""), reverse=True)
 
 
 def _log_step_success(step_number: int, step_name: str) -> None:
@@ -113,11 +112,11 @@ def _log_step_failure(step_number: int, step_name: str, exc: Exception) -> None:
 def _get_settings_engine():
     global _settings_engine
     if _settings_engine is None:
-        pg_user = os.getenv("PG_USER", "postgres")
+        pg_user     = os.getenv("PG_USER",     "postgres")
         pg_password = os.getenv("PG_PASSWORD", "delaypilot2026")
-        pg_host = os.getenv("PG_HOST", "localhost")
-        pg_port = os.getenv("PG_PORT", "5432")
-        pg_db = os.getenv("PG_DB", "delaypilot_db")
+        pg_host     = os.getenv("PG_HOST",     "localhost")
+        pg_port     = os.getenv("PG_PORT",     "5432")
+        pg_db       = os.getenv("PG_DB",       "delaypilot_db")
         url = f"postgresql+psycopg2://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"
         _settings_engine = create_engine(url)
     return _settings_engine
@@ -128,7 +127,6 @@ def _valid_refresh_minutes(value: Any) -> Optional[int]:
         minutes = int(str(value).strip())
     except (TypeError, ValueError):
         return None
-
     if 5 <= minutes <= 120:
         return minutes
     return None
@@ -146,7 +144,6 @@ def _read_refresh_interval_minutes_from_db() -> Optional[int]:
         ("SELECT value FROM system_settings WHERE name = :key LIMIT 1", "value"),
         ("SELECT refresh_interval_minutes FROM system_settings LIMIT 1", "refresh_interval_minutes"),
     ]
-
     engine = _get_settings_engine()
     for sql, column_name in queries:
         try:
@@ -155,25 +152,21 @@ def _read_refresh_interval_minutes_from_db() -> Optional[int]:
         except Exception as exc:
             logger.debug("[background] Refresh interval settings query failed: %s", exc)
             continue
-
         if row:
             minutes = _valid_refresh_minutes(row.get(column_name))
             if minutes is not None:
                 return minutes
-
     return None
 
 
 def get_refresh_interval_sec() -> int:
     global _interval_cache_checked_at, _interval_cache_value_sec
-
     now = time.monotonic()
     if (
         _interval_cache_value_sec is not None
         and now - _interval_cache_checked_at < 60
     ):
         return _interval_cache_value_sec
-
     minutes = _read_refresh_interval_minutes_from_db()
     _interval_cache_value_sec = minutes * 60 if minutes is not None else _fallback_refresh_interval_sec()
     _interval_cache_checked_at = now
@@ -187,15 +180,18 @@ def _run_full_refresh():
     Execute one complete data refresh cycle in order:
 
       1. Weather  — Open-Meteo hourly data
-      2. FIDS     — Aerodatabox live flight window → flights_raw
+      2. FIDS     — Aerodatabox live window → flights_raw
       3. Features — build featured_muc_rxn_wx3
       4. Features — build featured_muc_rxn_wx3_fe  (what /flights reads)
-      5. Status   — Aerodatabox Flight Status API  → flight_status_live
-      6. Snapshot — Resolve tier-priority delay + upsert analytics table
+      5. Predictions — run_batch_predictions()     ← NEW
+                       reads featured_muc_rxn_wx3_fe, scores all rows,
+                       writes flight_predictions (DROP + INSERT each cycle)
+      6. Status   — Aerodatabox Flight Status API  → flight_status_live
+      7. Snapshot — Resolve tier-priority delay + upsert analytics table
 
-    Steps 1-4 and Step 5 run in the same cycle so FIDS data and
-    Flight Status data are always from the same refresh timestamp.
-    Step 5 runs AFTER feature rebuild so it reads the latest flights_raw.
+    Step 5 runs AFTER feature rebuild (so features are current) and BEFORE
+    flight status ingestion (so the snapshot in Step 7 can combine fresh
+    ML scores with confirmed delays from the same cycle).
     """
     if _state["running"]:
         logger.info("[background] Refresh already in progress — skipping this tick.")
@@ -220,10 +216,10 @@ def _run_full_refresh():
     try:
         from ingest_weather_live import update_weather_live
         update_weather_live()
-        logger.info("[background] Step 1/6 ✓ Weather updated.")
+        logger.info("[background] Step 1/7 ✓ Weather updated.")
         _log_step_success(1, "Weather")
     except Exception as e:
-        logger.warning("[background] Step 1/6 ✗ Weather update failed: %s", e)
+        logger.warning("[background] Step 1/7 ✗ Weather update failed: %s", e)
         _state["last_error"] = str(e)
         _log_step_failure(1, "Weather", e)
 
@@ -232,10 +228,10 @@ def _run_full_refresh():
         from ingest_flights_live import ingest_live_muc_window
         ingest_live_muc_window()
         _state["fids_last_ran"] = datetime.now(timezone.utc)
-        logger.info("[background] Step 2/6 ✓ FIDS ingested.")
+        logger.info("[background] Step 2/7 ✓ FIDS ingested.")
         _log_step_success(2, "FIDS")
     except Exception as e:
-        logger.warning("[background] Step 2/6 ✗ FIDS ingest failed: %s", e)
+        logger.warning("[background] Step 2/7 ✗ FIDS ingest failed: %s", e)
         _state["last_error"] = str(e)
         _log_step_failure(2, "FIDS", e)
 
@@ -243,55 +239,64 @@ def _run_full_refresh():
     try:
         from build_featured_muc_rxn_wx3 import build_featured_muc_rxn_wx3
         build_featured_muc_rxn_wx3()
-        logger.info("[background] Step 3/6 ✓ featured_muc_rxn_wx3 rebuilt.")
-        _log_step_success(3, "Feature build 1")
+        logger.info("[background] Step 3/7 ✓ featured_muc_rxn_wx3 rebuilt.")
+        _log_step_success(3, "Feature pass 1")
     except Exception as e:
-        logger.warning("[background] Step 3/6 ✗ Feature build pass 1 failed: %s", e)
+        logger.warning("[background] Step 3/7 ✗ Feature pass 1 failed: %s", e)
         _state["last_error"] = str(e)
-        _log_step_failure(3, "Feature build 1", e)
+        _log_step_failure(3, "Feature pass 1", e)
 
     # ── Step 4: Feature build pass 2 ─────────────────────────────────────────
     try:
         from build_featured_muc_rxn_wx3_fe import build_featured_muc_rxn_wx3_fe
         build_featured_muc_rxn_wx3_fe()
-        logger.info("[background] Step 4/6 ✓ featured_muc_rxn_wx3_fe rebuilt.")
-        _log_step_success(4, "Feature build 2")
+        logger.info("[background] Step 4/7 ✓ featured_muc_rxn_wx3_fe rebuilt.")
+        _log_step_success(4, "Feature pass 2")
     except Exception as e:
-        logger.warning("[background] Step 4/6 ✗ Feature build pass 2 failed: %s", e)
+        logger.warning("[background] Step 4/7 ✗ Feature pass 2 failed: %s", e)
         _state["last_error"] = str(e)
-        _log_step_failure(4, "Feature build 2", e)
+        _log_step_failure(4, "Feature pass 2", e)
 
-    # ── Step 5: Flight Status API ─────────────────────────────────────────────
-    # Runs AFTER feature rebuild so it sees the latest flights_raw rows.
-    # This guarantees Flight Status and FIDS data share the same cycle timestamp.
+    # ── Step 5: Batch ML Predictions ─────────────────────────────────────────
+    # This is the step that was missing in the original cycle.
+    # Without this, flight_predictions holds startup-time scores even after
+    # the feature tables have been refreshed.  With it, every /flights response
+    # and every /predict/from-db call reads scores computed from current-cycle
+    # features.  The step is non-fatal: a model-load failure should not prevent
+    # the dashboard from receiving updated flight status in Step 6.
+    try:
+        from run_batch_predictions import run_batch_predictions
+        n_written = run_batch_predictions()
+        _state["predictions_last_ran"] = datetime.now(timezone.utc)
+        logger.info("[background] Step 5/7 ✓ Batch predictions written (%d rows).", n_written)
+        _log_step_success(5, f"Batch predictions ({n_written} rows)")
+    except Exception as e:
+        logger.warning("[background] Step 5/7 ✗ Batch predictions failed (non-fatal): %s", e)
+        _state["last_error"] = str(e)
+        _log_step_failure(5, "Batch predictions", e)
+
+    # ── Step 6: Flight Status API ─────────────────────────────────────────────
     try:
         from update_flight_status import update_flight_status
         update_flight_status()
         _state["status_last_ran"] = datetime.now(timezone.utc)
-        logger.info("[background] Step 5/6 ✓ Flight Status updated.")
-        _log_step_success(5, "Flight Status")
+        logger.info("[background] Step 6/7 ✓ Flight status updated.")
+        _log_step_success(6, "Flight status")
     except Exception as e:
-        logger.warning("[background] Step 5/6 ✗ Flight Status failed: %s", e)
+        logger.warning("[background] Step 6/7 ✗ Flight status update failed: %s", e)
         _state["last_error"] = str(e)
-        _log_step_failure(5, "Flight Status", e)
+        _log_step_failure(6, "Flight status", e)
 
-    # ── Step 6: Delay Analytics Snapshot ─────────────────────────────────────
-    # Reads the fully-resolved flight state (same JOIN as /flights endpoint:
-    # featured_muc_rxn_wx3_fe + flight_status_live + flight_predictions) and
-    # applies the same 3-tier priority logic as predictionService.js before
-    # upserting into flight_delay_snapshots.
-    # UPSERT (not replace): history accumulates across refresh cycles so the
-    # dashboard trend + cause charts improve as more data comes in.
-    # Non-fatal: failure here does not affect flights table or ML predictions.
+    # ── Step 7: Delay Analytics Snapshot ─────────────────────────────────────
     try:
         from snapshot_delay_analytics import snapshot_delay_analytics
         snapshot_delay_analytics()
-        logger.info("[background] Step 6/6 ✓ Delay analytics snapshot written.")
-        _log_step_success(6, "Delay snapshot")
+        logger.info("[background] Step 7/7 ✓ Delay analytics snapshot written.")
+        _log_step_success(7, "Delay snapshot")
     except Exception as e:
-        logger.warning("[background] Step 6/6 ✗ Delay analytics snapshot failed: %s", e)
+        logger.warning("[background] Step 7/7 ✗ Delay analytics snapshot failed: %s", e)
         _state["last_error"] = str(e)
-        _log_step_failure(6, "Delay snapshot", e)
+        _log_step_failure(7, "Delay snapshot", e)
 
     elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
     if _state["last_error"] is None:
@@ -310,13 +315,10 @@ def _run_full_refresh():
 
 def _scheduler_loop():
     """
-    Daemon loop — waits refresh_interval_sec before the first refresh,
-    then repeats every refresh_interval_sec thereafter.
- 
-    startup_delaypilot.py already runs run_pipeline.py synchronously before
-    the API starts, so all tables are fresh at boot. The first background
-    cycle is intentionally deferred to avoid a redundant double-refresh and
-    an unnecessary second Aerodatabox API call at startup.
+    Daemon loop — defers the first cycle by refresh_interval_sec because
+    start_delaypilot.py already runs run_pipeline.py (which includes batch
+    predictions) synchronously before the API starts.  The first background
+    cycle would be a redundant double-refresh at boot.
     """
     initial_interval_sec = get_refresh_interval_sec()
     logger.info(
@@ -324,9 +326,9 @@ def _scheduler_loop():
         initial_interval_sec // 60,
         initial_interval_sec // 60,
     )
- 
-    last_ran = time.monotonic()   # ← defers first run by refresh_interval_sec
- 
+
+    last_ran = time.monotonic()   # defers first run by refresh_interval_sec
+
     while True:
         now = time.monotonic()
         refresh_interval_sec = get_refresh_interval_sec()
@@ -338,9 +340,9 @@ def _scheduler_loop():
             )
             t.start()
             last_ran = now
- 
-        time.sleep(60)   # check every 60 s — lightweight, no busy-wait
- 
+
+        time.sleep(60)   # lightweight check — no busy-wait
+
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -363,7 +365,4 @@ def start_background_refresh():
         daemon=True,
     )
     _scheduler_thread.start()
-    logger.info("[background] Scheduler thread launched.")
-
-
-
+    logger.info("[background] Scheduler thread started.")

@@ -35,12 +35,12 @@ ROOT = Path(__file__).resolve().parent
 
 
 def run_pipeline() -> None:
-    logger.info("═══ Step 1: Historical ETL pipeline ═══")
+    logger.info("═══ Step 1: Real-Time ETL pipeline ═══")
     subprocess.run(
         [sys.executable, str(ROOT / "run_pipeline.py")],
         check=True
     )
-    logger.info("Historical pipeline finished — starting API server.")
+    logger.info("Real-Time pipeline finished — starting API server.")
 
 
 def start_api() -> None:
