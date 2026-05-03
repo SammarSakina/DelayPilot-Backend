@@ -39,7 +39,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import create_engine, text
@@ -59,14 +59,56 @@ _state = {
     "running":     False,
     "last_error":  None,
     "fids_last_ran":        None,
-    "predictions_last_ran": None,   # NEW — tracks when batch predictions last ran
+    "predictions_last_ran": None,
     "status_last_ran":      None,
+    "scheduler_enabled":    True,
+    "next_run_at":          None,
 }
 
 
 def get_refresh_state() -> dict:
     """Return a snapshot of refresh state — safe to call from any thread."""
     return dict(_state)
+
+
+def set_scheduler_enabled(enabled: bool) -> None:
+    """
+    Enable or disable the background scheduler without
+    restarting the server. When disabled, the scheduler
+    loop keeps running but skips all refresh cycles.
+    Existing data in the DB and UI remain untouched.
+    """
+    _state["scheduler_enabled"] = bool(enabled)
+    logger.info(
+        "[background] Scheduler %s by admin.",
+        "ENABLED" if enabled else "DISABLED",
+    )
+    append_pipeline_log({
+        "event": f"Scheduler {'enabled' if enabled else 'disabled'} by admin",
+        "status": "success" if enabled else "skipped",
+        "timestamp": _now_iso(),
+    })
+
+
+def get_scheduler_status() -> dict:
+    """
+    Return scheduler enabled state and countdown to next run.
+    Used by GET /scheduler/status endpoint.
+    """
+    next_run_at = _state.get("next_run_at")
+    seconds_remaining = None
+    if next_run_at is not None and _state["scheduler_enabled"]:
+        delta = (next_run_at - datetime.now(timezone.utc)).total_seconds()
+        seconds_remaining = max(0, int(delta))
+    return {
+        "enabled":           _state["scheduler_enabled"],
+        "next_run_at":       next_run_at.isoformat() if next_run_at else None,
+        "seconds_remaining": seconds_remaining,
+        "interval_minutes":  get_refresh_interval_sec() // 60,
+        "last_ran":          _state["last_ran"].isoformat()
+                             if _state["last_ran"] else None,
+        "running":           _state["running"],
+    }
 
 
 def _now_iso() -> str:
@@ -321,6 +363,12 @@ def _scheduler_loop():
     cycle would be a redundant double-refresh at boot.
     """
     initial_interval_sec = get_refresh_interval_sec()
+    # Set next_run_at immediately so the UI timer shows
+    # on first poll rather than waiting for the first sleep
+    _state["next_run_at"] = (
+        datetime.now(timezone.utc) +
+        timedelta(seconds=initial_interval_sec)
+    )
     logger.info(
         "[background] Scheduler started — first refresh in %d min, then every %d min.",
         initial_interval_sec // 60,
@@ -330,18 +378,39 @@ def _scheduler_loop():
     last_ran = time.monotonic()   # defers first run by refresh_interval_sec
 
     while True:
-        now = time.monotonic()
-        refresh_interval_sec = get_refresh_interval_sec()
-        if now - last_ran >= refresh_interval_sec:
-            t = threading.Thread(
-                target=_run_full_refresh,
-                name="delaypilot-refresh",
-                daemon=True,
-            )
-            t.start()
-            last_ran = now
+        interval_sec = get_refresh_interval_sec()
+        next_run = datetime.now(timezone.utc) + timedelta(seconds=interval_sec)
+        _state["next_run_at"] = next_run
 
-        time.sleep(60)   # lightweight check — no busy-wait
+        # Sleep in small increments so we can respond to
+        # disable/enable without waiting the full interval.
+        elapsed = 0
+        while elapsed < interval_sec:
+            time.sleep(5)
+            elapsed += 5
+            # Re-read next_run_at in case interval changed
+            if not _state["scheduler_enabled"]:
+                # Keep updating next_run_at so timer resets
+                # when re-enabled
+                _state["next_run_at"] = (
+                    datetime.now(timezone.utc) +
+                    timedelta(
+                        seconds=get_refresh_interval_sec()
+                    )
+                )
+
+        if not _state["scheduler_enabled"]:
+            logger.info(
+                "[background] Scheduler disabled — skipping refresh cycle."
+            )
+            append_pipeline_log({
+                "event": "Refresh cycle skipped (scheduler disabled by admin)",
+                "status": "skipped",
+                "timestamp": _now_iso(),
+            })
+            continue
+
+        _run_full_refresh()
 
 
 # ── Public entry point ────────────────────────────────────────────────────────

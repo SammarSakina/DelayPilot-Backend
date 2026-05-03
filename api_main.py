@@ -56,8 +56,11 @@ app.add_middleware(
 model_service = V3FinalModelService(models_dir=str(os.path.join(os.path.dirname(__file__), "models")))
 engine = get_engine()
 # ── Background refresh scheduler ─────────────────────────────
-from background_refresh import start_background_refresh, get_refresh_state
-
+from background_refresh import (
+        start_background_refresh,
+        get_refresh_state,
+        set_scheduler_enabled,
+    )
 
 def _health_payload() -> Dict[str, Any]:
     state = get_refresh_state()
@@ -89,15 +92,28 @@ def on_startup():
             )
         """))
         conn.commit()
-    import os as _sched_os
     from dotenv import load_dotenv as _sched_ldenv
     _sched_ldenv()
-    if _sched_os.getenv("ENABLE_SCHEDULER", "true").lower() != "false":
-        start_background_refresh()
-    else:
+    import os as _sched_os
+    from background_refresh import (
+        start_background_refresh,
+        set_scheduler_enabled,
+    )
+    # Always start the scheduler thread so next_run_at is
+    # tracked and the UI timer works immediately.
+    start_background_refresh()
+    _initially_enabled = (
+        _sched_os.getenv("ENABLE_SCHEDULER", "true").lower() != "false"
+    )
+    if not _initially_enabled:
+        set_scheduler_enabled(False)
         logger.info(
-            "[background] Scheduler disabled via ENABLE_SCHEDULER=false"
+            "[background] Scheduler thread started but DISABLED "
+            "via ENABLE_SCHEDULER=false — enable via admin panel."
         )
+    else:
+        logger.info("[background] Scheduler started and ENABLED.")
+
 
 class DbPredictionRequest(BaseModel):
     """
@@ -1389,6 +1405,31 @@ def retrain_status(job_id: int):
             "mae_reg": _row[17],
         } if _row[13] is not None else None,
     }
+
+
+# ── Scheduler control endpoints ───────────────────────────────────────────────
+
+@app.get("/scheduler/status")
+def scheduler_status():
+    """Return current scheduler state and countdown."""
+    from background_refresh import get_scheduler_status
+    return get_scheduler_status()
+
+
+@app.post("/scheduler/enable")
+def scheduler_enable():
+    """Enable the background scheduler."""
+    from background_refresh import set_scheduler_enabled
+    set_scheduler_enabled(True)
+    return {"scheduler_enabled": True}
+
+
+@app.post("/scheduler/disable")
+def scheduler_disable():
+    """Disable the background scheduler."""
+    from background_refresh import set_scheduler_enabled
+    set_scheduler_enabled(False)
+    return {"scheduler_enabled": False}
 
 
 # For running with: python api_main.py (useful in dev)
