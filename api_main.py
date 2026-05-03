@@ -89,7 +89,15 @@ def on_startup():
             )
         """))
         conn.commit()
-    start_background_refresh()
+    import os as _sched_os
+    from dotenv import load_dotenv as _sched_ldenv
+    _sched_ldenv()
+    if _sched_os.getenv("ENABLE_SCHEDULER", "true").lower() != "false":
+        start_background_refresh()
+    else:
+        logger.info(
+            "[background] Scheduler disabled via ENABLE_SCHEDULER=false"
+        )
 
 class DbPredictionRequest(BaseModel):
     """
@@ -1259,6 +1267,128 @@ def get_delay_trends(date: str = None):
     except Exception as e:
         logger.error("/flights/analytics error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Retraining endpoints ──────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+
+class _RetrainStartRequest(_BaseModel):
+    triggered_by: str = "admin"
+
+
+@app.post("/retrain/start")
+def retrain_start(req: _RetrainStartRequest):
+    import psycopg2 as _pg
+    import os as _os
+    from dotenv import load_dotenv as _ldenv
+    _ldenv()
+
+    def _make_conn():
+        _url = _os.getenv("DATABASE_URL")
+        if _url:
+            if _url.startswith("postgres://"):
+                _url = _url.replace("postgres://", "postgresql://", 1)
+            if "sslmode" not in _url:
+                _url += ("&" if "?" in _url else "?") + "sslmode=require"
+            return _pg.connect(_url)
+        return _pg.connect(
+            host=_os.getenv("PG_HOST", "localhost"),
+            port=int(_os.getenv("PG_PORT", "5432")),
+            dbname=_os.getenv("PG_DB", "delaypilot_db"),
+            user=_os.getenv("PG_USER", "postgres"),
+            password=_os.getenv("PG_PASSWORD", "delaypilot2026"),
+        )
+
+    _conn = _make_conn()
+    try:
+        with _conn.cursor() as _cur:
+            _cur.execute(
+                "INSERT INTO retrain_jobs (triggered_by, status) "
+                "VALUES (%s, 'queued') RETURNING id",
+                (req.triggered_by,),
+            )
+            _job_id = _cur.fetchone()[0]
+        _conn.commit()
+    finally:
+        _conn.close()
+
+    import threading as _th
+    from retrain_pipeline import run_retrain
+    _t = _th.Thread(target=run_retrain, args=(_job_id,), daemon=True)
+    _t.start()
+
+    logger.info("Retraining job %d started by %s", _job_id, req.triggered_by)
+    return {"job_id": _job_id, "status": "queued"}
+
+
+@app.get("/retrain/status/{job_id}")
+def retrain_status(job_id: int):
+    import psycopg2 as _pg
+    import os as _os
+    from dotenv import load_dotenv as _ldenv
+    _ldenv()
+
+    def _make_conn():
+        _url = _os.getenv("DATABASE_URL")
+        if _url:
+            if _url.startswith("postgres://"):
+                _url = _url.replace("postgres://", "postgresql://", 1)
+            if "sslmode" not in _url:
+                _url += ("&" if "?" in _url else "?") + "sslmode=require"
+            return _pg.connect(_url)
+        return _pg.connect(
+            host=_os.getenv("PG_HOST", "localhost"),
+            port=int(_os.getenv("PG_PORT", "5432")),
+            dbname=_os.getenv("PG_DB", "delaypilot_db"),
+            user=_os.getenv("PG_USER", "postgres"),
+            password=_os.getenv("PG_PASSWORD", "delaypilot2026"),
+        )
+
+    _conn = _make_conn()
+    try:
+        with _conn.cursor() as _cur:
+            _cur.execute(
+                """SELECT id, triggered_by, triggered_at, started_at,
+                          finished_at, status, current_step, step_detail,
+                          outcome, error_message, backfill_start, backfill_end,
+                          api_calls_made, new_auc15, new_prauc15,
+                          new_auc30, new_prauc30, new_mae_reg
+                   FROM retrain_jobs WHERE id = %s""",
+                (job_id,),
+            )
+            _row = _cur.fetchone()
+    finally:
+        _conn.close()
+
+    if _row is None:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=404, detail=f"Job {job_id} not found."
+        )
+
+    return {
+        "job_id":         _row[0],
+        "triggered_by":   _row[1],
+        "triggered_at":   _row[2].isoformat() if _row[2] else None,
+        "started_at":     _row[3].isoformat() if _row[3] else None,
+        "finished_at":    _row[4].isoformat() if _row[4] else None,
+        "status":         _row[5],
+        "current_step":   _row[6],
+        "step_detail":    _row[7],
+        "outcome":        _row[8],
+        "error_message":  _row[9],
+        "backfill_start": str(_row[10]) if _row[10] else None,
+        "backfill_end":   str(_row[11]) if _row[11] else None,
+        "api_calls_made": _row[12],
+        "candidate_metrics": {
+            "auc15":   _row[13],
+            "prauc15": _row[14],
+            "auc30":   _row[15],
+            "prauc30": _row[16],
+            "mae_reg": _row[17],
+        } if _row[13] is not None else None,
+    }
 
 
 # For running with: python api_main.py (useful in dev)

@@ -25,12 +25,15 @@ class V3FinalModelService:
           * returns p_delay_15, p_delay_30 and UI-friendly minutes prediction
     """
 
-    def __init__(self, models_dir: Optional[str] = None) -> None:
+    def __init__(self, models_dir: Optional[str] = None,
+                 metadata_filename: Optional[str] = None) -> None:
         base_dir = Path(models_dir) if models_dir is not None else Path(__file__).parent / "models"
         self.models_dir = base_dir
 
-        meta_path = self.models_dir / "metadata_v3_final.json"
-        groups_path = self.models_dir / "cause_groups_v3_final.json"
+        _meta_filename   = metadata_filename or "metadata_v3_final.json"
+        _groups_filename = _meta_filename.replace("metadata_", "cause_groups_")
+        meta_path   = self.models_dir / _meta_filename
+        groups_path = self.models_dir / _groups_filename
 
         if not meta_path.exists():
             logger.error("metadata_v3_final.json not found at %s", meta_path)
