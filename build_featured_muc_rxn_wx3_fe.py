@@ -257,6 +257,13 @@ def build_featured_muc_rxn_wx3_fe(max_rows: Optional[int] = None) -> None:
             df["prev_delay_min_safe"], errors="coerce"
         ).clip(lower=-180, upper=600)
 
+    # Convert sched_hour_utc from datetime-floor (used for merging above) to
+    # integer 0–23 so cause-scoring can use it as a time-of-day signal.
+    if "sched_utc" in df.columns:
+        df["sched_hour_utc"] = pd.to_datetime(df["sched_utc"], utc=True).dt.hour
+    else:
+        df["sched_hour_utc"] = -1
+
     # --- Persist to Postgres ---
 
     df.to_sql(

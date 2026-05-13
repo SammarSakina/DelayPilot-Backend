@@ -33,15 +33,14 @@ def load_flight_parquet_to_db(max_rows: int = 50000) -> None:
     The source path may contain non-parquet files (e.g. raw JSON); we only read
     .parquet files.
     """
-    # Path can be a single parquet file or a directory that includes parquet files
-
+    
     # (TO BE ADJUSTED LATER )
     flights_path = r"F:\FYP Notebooks\data\api_backfill\aerodatabox\muc_365d_fids"
 
     if not os.path.exists(flights_path):
         logger.warning("Flight parquet path not found: %s", flights_path)
         if ingest_live_muc_window is not None:
-            logger.info("Falling back to live Aerodatabox ingestion instead.")
+            logger.info("Fetching live Flights data from Aerodatabox ingestion instead.")
             ingest_live_muc_window()
             return
         else:

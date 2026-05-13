@@ -56,8 +56,11 @@ app.add_middleware(
 model_service = V3FinalModelService(models_dir=str(os.path.join(os.path.dirname(__file__), "models")))
 engine = get_engine()
 # ── Background refresh scheduler ─────────────────────────────
-from background_refresh import start_background_refresh, get_refresh_state
-
+from background_refresh import (
+        start_background_refresh,
+        get_refresh_state,
+        set_scheduler_enabled,
+    )
 
 def _health_payload() -> Dict[str, Any]:
     state = get_refresh_state()
@@ -89,7 +92,28 @@ def on_startup():
             )
         """))
         conn.commit()
+    from dotenv import load_dotenv as _sched_ldenv
+    _sched_ldenv()
+    import os as _sched_os
+    from background_refresh import (
+        start_background_refresh,
+        set_scheduler_enabled,
+    )
+    # Always start the scheduler thread so next_run_at is
+    # tracked and the UI timer works immediately.
     start_background_refresh()
+    _initially_enabled = (
+        _sched_os.getenv("ENABLE_SCHEDULER", "true").lower() != "false"
+    )
+    if not _initially_enabled:
+        set_scheduler_enabled(False)
+        logger.info(
+            "[background] Scheduler thread started but DISABLED "
+            "via ENABLE_SCHEDULER=false — enable via admin panel."
+        )
+    else:
+        logger.info("[background] Scheduler started and ENABLED.")
+
 
 class DbPredictionRequest(BaseModel):
     """
@@ -343,19 +367,65 @@ def predict_from_db(req: DbPredictionRequest):
             sched_dt.isoformat(),
         )
 
-        # Patch C — enrich with confirmed delay from flight_status_live
+        # Patch C — enrich with confirmed delay, falling back to flights_raw
         try:
             status_q = text("""
-                SELECT op_status, confirmed_delay_min, etd_utc, atd_utc, eta_utc, ata_utc
-                FROM flight_status_live
-                WHERE number_raw  = :number_raw
-                  AND flight_date = DATE(:sched_utc AT TIME ZONE 'UTC')
+                SELECT
+                    COALESCE(
+                        s.op_status,
+                        CASE r.status
+                            WHEN 'Landed'     THEN 'Landed'
+                            WHEN 'EnRoute'    THEN 'EnRoute'
+                            WHEN 'En Route'   THEN 'EnRoute'
+                            WHEN 'Departed'   THEN 'EnRoute'
+                            WHEN 'Cancelled'  THEN 'Cancelled'
+                            WHEN 'Diverted'   THEN 'Diverted'
+                            WHEN 'GateClosed' THEN 'EnRoute'
+                            WHEN 'Boarding'   THEN 'Scheduled'
+                            WHEN 'CheckIn'    THEN 'Scheduled'
+                            WHEN 'Delayed'    THEN 'Scheduled'
+                            WHEN 'Expected'   THEN 'Scheduled'
+                            ELSE NULL
+                        END,
+                        'Scheduled'
+                    ) AS op_status,
+                    COALESCE(
+                        s.confirmed_delay_min,
+                        CASE
+                            WHEN r.movement = 'departure' AND r.dep_best_utc IS NOT NULL
+                                THEN ROUND(
+                                    EXTRACT(EPOCH FROM (r.dep_best_utc - r.dep_sched_utc)) / 60.0
+                                , 1)
+                            WHEN r.movement = 'arrival' AND r.arr_best_utc IS NOT NULL
+                                THEN ROUND(
+                                    EXTRACT(EPOCH FROM (r.arr_best_utc - r.arr_sched_utc)) / 60.0
+                                , 1)
+                            ELSE NULL
+                        END
+                    ) AS confirmed_delay_min,
+                    COALESCE(s.etd_utc, r.dep_rev_utc)   AS etd_utc,
+                    COALESCE(s.atd_utc, r.dep_runway_utc) AS atd_utc,
+                    COALESCE(s.eta_utc, r.arr_rev_utc)   AS eta_utc,
+                    COALESCE(s.ata_utc, r.arr_runway_utc) AS ata_utc
+                FROM flights_raw r
+                LEFT JOIN flight_status_live s
+                       ON s.number_raw  = r.number_raw
+                      AND s.flight_date = DATE(
+                              COALESCE(r.dep_sched_utc, r.arr_sched_utc)
+                              AT TIME ZONE 'UTC'
+                          )
+                WHERE r.number_raw = :number_raw
+                  AND COALESCE(r.dep_sched_utc, r.arr_sched_utc) IS NOT NULL
+                ORDER BY
+                    ABS(EXTRACT(EPOCH FROM (
+                        COALESCE(r.dep_sched_utc, r.arr_sched_utc) - :sched_utc_ts
+                    ))) ASC
                 LIMIT 1
             """)
             with engine.connect() as conn:
                 srow = conn.execute(status_q, {
-                    "number_raw": req.number_raw,
-                    "sched_utc":  sched_dt,
+                    "number_raw":   req.number_raw,
+                    "sched_utc_ts": sched_dt,
                 }).fetchone()
 
             if srow:
@@ -368,6 +438,10 @@ def predict_from_db(req: DbPredictionRequest):
             else:
                 result["op_status"]           = "Scheduled"
                 result["confirmed_delay_min"] = None
+                result["etd_utc"]             = None
+                result["atd_utc"]             = None
+                result["eta_utc"]             = None
+                result["ata_utc"]             = None
         except Exception as status_exc:
             # Non-fatal — flight_status_live may not exist yet
             logger.warning("Could not fetch flight status for prediction: %s", status_exc)
@@ -661,13 +735,45 @@ def get_flights(date: str = None):
                     WHEN f.movement = 'departure' THEN r.dep_best_utc
                     ELSE r.arr_best_utc
                 END AS actual_utc,
-                -- Status from flight_status_live (authoritative)
-                COALESCE(s.op_status, 'Scheduled')  AS op_status,
+                -- Status: flight_status_live (authoritative) → FIDS r.status → 'Scheduled'
+                COALESCE(
+                    s.op_status,
+                    CASE r.status
+                        WHEN 'Landed'     THEN 'Landed'
+                        WHEN 'EnRoute'    THEN 'EnRoute'
+                        WHEN 'En Route'   THEN 'EnRoute'
+                        WHEN 'Departed'   THEN 'EnRoute'
+                        WHEN 'Cancelled'  THEN 'Cancelled'
+                        WHEN 'Diverted'   THEN 'Diverted'
+                        WHEN 'GateClosed' THEN 'EnRoute'
+                        WHEN 'Boarding'   THEN 'Scheduled'
+                        WHEN 'CheckIn'    THEN 'Scheduled'
+                        WHEN 'Delayed'    THEN 'Scheduled'
+                        WHEN 'Expected'   THEN 'Scheduled'
+                        WHEN 'Scheduled'  THEN 'Scheduled'
+                        ELSE NULL
+                    END,
+                    'Scheduled'
+                ) AS op_status,
                 s.etd_utc,
                 s.atd_utc,
                 s.eta_utc,
                 s.ata_utc,
-                s.confirmed_delay_min,
+                -- confirmed_delay_min: flight_status_live (Tier 1) → FIDS best times (Tier 2)
+                COALESCE(
+                    s.confirmed_delay_min,
+                    CASE
+                        WHEN f.movement = 'departure' AND r.dep_best_utc IS NOT NULL
+                            THEN ROUND(
+                                EXTRACT(EPOCH FROM (r.dep_best_utc - r.dep_sched_utc)) / 60.0
+                            , 1)
+                        WHEN f.movement = 'arrival' AND r.arr_best_utc IS NOT NULL
+                            THEN ROUND(
+                                EXTRACT(EPOCH FROM (r.arr_best_utc - r.arr_sched_utc)) / 60.0
+                            , 1)
+                        ELSE NULL
+                    END
+                ) AS confirmed_delay_min,
                 -- ML batch predictions (from flight_predictions, populated by run_batch_predictions.py)
                 p.minutes_ui            AS ml_minutes_ui,
                 p.p_delay_15            AS ml_p_delay_15,
@@ -1177,6 +1283,153 @@ def get_delay_trends(date: str = None):
     except Exception as e:
         logger.error("/flights/analytics error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Retraining endpoints ──────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+
+class _RetrainStartRequest(_BaseModel):
+    triggered_by: str = "admin"
+
+
+@app.post("/retrain/start")
+def retrain_start(req: _RetrainStartRequest):
+    import psycopg2 as _pg
+    import os as _os
+    from dotenv import load_dotenv as _ldenv
+    _ldenv()
+
+    def _make_conn():
+        _url = _os.getenv("DATABASE_URL")
+        if _url:
+            if _url.startswith("postgres://"):
+                _url = _url.replace("postgres://", "postgresql://", 1)
+            if "sslmode" not in _url:
+                _url += ("&" if "?" in _url else "?") + "sslmode=require"
+            return _pg.connect(_url)
+        return _pg.connect(
+            host=_os.getenv("PG_HOST", "localhost"),
+            port=int(_os.getenv("PG_PORT", "5432")),
+            dbname=_os.getenv("PG_DB", "delaypilot_db"),
+            user=_os.getenv("PG_USER", "postgres"),
+            password=_os.getenv("PG_PASSWORD", "delaypilot2026"),
+        )
+
+    _conn = _make_conn()
+    try:
+        with _conn.cursor() as _cur:
+            _cur.execute(
+                "INSERT INTO retrain_jobs (triggered_by, status) "
+                "VALUES (%s, 'queued') RETURNING id",
+                (req.triggered_by,),
+            )
+            _job_id = _cur.fetchone()[0]
+        _conn.commit()
+    finally:
+        _conn.close()
+
+    import threading as _th
+    from retrain_pipeline import run_retrain
+    _t = _th.Thread(target=run_retrain, args=(_job_id,), daemon=True)
+    _t.start()
+
+    logger.info("Retraining job %d started by %s", _job_id, req.triggered_by)
+    return {"job_id": _job_id, "status": "queued"}
+
+
+@app.get("/retrain/status/{job_id}")
+def retrain_status(job_id: int):
+    import psycopg2 as _pg
+    import os as _os
+    from dotenv import load_dotenv as _ldenv
+    _ldenv()
+
+    def _make_conn():
+        _url = _os.getenv("DATABASE_URL")
+        if _url:
+            if _url.startswith("postgres://"):
+                _url = _url.replace("postgres://", "postgresql://", 1)
+            if "sslmode" not in _url:
+                _url += ("&" if "?" in _url else "?") + "sslmode=require"
+            return _pg.connect(_url)
+        return _pg.connect(
+            host=_os.getenv("PG_HOST", "localhost"),
+            port=int(_os.getenv("PG_PORT", "5432")),
+            dbname=_os.getenv("PG_DB", "delaypilot_db"),
+            user=_os.getenv("PG_USER", "postgres"),
+            password=_os.getenv("PG_PASSWORD", "delaypilot2026"),
+        )
+
+    _conn = _make_conn()
+    try:
+        with _conn.cursor() as _cur:
+            _cur.execute(
+                """SELECT id, triggered_by, triggered_at, started_at,
+                          finished_at, status, current_step, step_detail,
+                          outcome, error_message, backfill_start, backfill_end,
+                          api_calls_made, new_auc15, new_prauc15,
+                          new_auc30, new_prauc30, new_mae_reg
+                   FROM retrain_jobs WHERE id = %s""",
+                (job_id,),
+            )
+            _row = _cur.fetchone()
+    finally:
+        _conn.close()
+
+    if _row is None:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=404, detail=f"Job {job_id} not found."
+        )
+
+    return {
+        "job_id":         _row[0],
+        "triggered_by":   _row[1],
+        "triggered_at":   _row[2].isoformat() if _row[2] else None,
+        "started_at":     _row[3].isoformat() if _row[3] else None,
+        "finished_at":    _row[4].isoformat() if _row[4] else None,
+        "status":         _row[5],
+        "current_step":   _row[6],
+        "step_detail":    _row[7],
+        "outcome":        _row[8],
+        "error_message":  _row[9],
+        "backfill_start": str(_row[10]) if _row[10] else None,
+        "backfill_end":   str(_row[11]) if _row[11] else None,
+        "api_calls_made": _row[12],
+        "candidate_metrics": {
+            "auc15":   _row[13],
+            "prauc15": _row[14],
+            "auc30":   _row[15],
+            "prauc30": _row[16],
+            "mae_reg": _row[17],
+        } if _row[13] is not None else None,
+    }
+
+
+# ── Scheduler control endpoints ───────────────────────────────────────────────
+
+@app.get("/scheduler/status")
+def scheduler_status():
+    """Return current scheduler state and countdown."""
+    from background_refresh import get_scheduler_status
+    return get_scheduler_status()
+
+
+@app.post("/scheduler/enable")
+def scheduler_enable():
+    """Enable the background scheduler."""
+    from background_refresh import set_scheduler_enabled
+    set_scheduler_enabled(True)
+    return {"scheduler_enabled": True}
+
+
+@app.post("/scheduler/disable")
+def scheduler_disable():
+    """Disable the background scheduler."""
+    from background_refresh import set_scheduler_enabled
+    set_scheduler_enabled(False)
+    return {"scheduler_enabled": False}
 
 
 # For running with: python api_main.py (useful in dev)

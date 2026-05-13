@@ -5,3 +5,10 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+
+# Retraining candidate model artefacts (never commit trained weights)
+models/candidate_*/
+models/v4_*/
+models/v5_*/
+models/v6_*/
+migrations/*.log

@@ -1,9 +1,9 @@
 """
-DelayPilot data pipeline runner (SRS Module 1 & 13).
+DelayPilot data pipeline runner
 
 Runs end-to-end:
-  1) Ingest weather CSV -> weather_hourly
-  2) Ingest flight parquet (50k sample) -> flights_raw
+  1) Ingest weather data -> weather_hourly
+  2) Ingest flight data -> flights_raw
   3) Build feature table -> training_features_v3
   4) Clean features -> training_features_v3_clean
 
@@ -41,10 +41,10 @@ def run():
 
     logger.info("Starting DelayPilot pipeline (PostgreSQL)")
 
-    logger.info("Step 1/8: Ingest weather CSV -> weather_hourly")
+    logger.info("Step 1/8: Ingest weather data -> weather_hourly")
     load_weather_csv_to_db()
 
-    logger.info("Step 2/8: Ingest flight parquet (sample 50k) -> flights_raw")
+    logger.info("Step 2/8: Ingest flight data -> flights_raw")
     load_flight_parquet_to_db()
 
     logger.info("Step 3/8: Build featured_muc_rxn_wx3 (reactionary + weather joins)")

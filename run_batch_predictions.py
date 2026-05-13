@@ -66,11 +66,12 @@ logger = logging.getLogger(__name__)
 
 
 CAUSE_LABEL_MAP = {
-    "Weather (MUC)": "Weather",
-    "En-Route Weather": "Weather",
-    "Reactionary": "Reactionary",
-    "ATC / Congestion": "Congestion",
+    "Weather (MUC)":        "Weather",
+    "En-Route Weather":     "Weather",
+    "Reactionary":          "Reactionary",
+    "ATC / Congestion":     "Congestion",
     "Airline / Turnaround": "Airline",
+    "Historical Patterns":  "Historical",
 }
 
 
@@ -141,36 +142,72 @@ def _derive_cause_scores(row: dict) -> dict[str, float]:
     prev_late15 = _f("prev_late15_safe")
     prev_late30 = _f("prev_late30_safe")
     prev_delay  = _f("prev_delay_min_safe")
+    y_delay     = _f("y_delay_min")   # FIDS observed delay for this flight
+
     rxn_score += prev_late30 * 0.35
     rxn_score += prev_late15 * 0.20
     rxn_score += min(prev_delay / 45.0, 1.0) * 0.50
+
+    # Live flights often have no prev-leg data; use FIDS observed delay as proxy.
+    # A flight already delayed in FIDS most likely has a late inbound aircraft.
+    if prev_delay == 0 and prev_late15 == 0 and y_delay >= 15:
+        rxn_score += min(y_delay / 60.0, 1.0) * 0.35
+
     scores["Reactionary"] = min(rxn_score, 1.0)
 
     # ── 4. ATC / Airport Congestion ──────────────────────────────────────────
-    # High flight counts in ±1h/2h window at MUC → congestion pressure
-    # Typical MUC hourly capacity ~50 movements. Counts are rolling 3h/5h windows.
-    dep_pm1h = _f("muc_dep_cnt_pm1h")
-    arr_pm1h = _f("muc_arr_cnt_pm1h")
-    dep_pm2h = _f("muc_dep_cnt_pm2h")
-    arr_pm2h = _f("muc_arr_cnt_pm2h")
+    dep_pm1h   = _f("muc_dep_cnt_pm1h")
+    arr_pm1h   = _f("muc_arr_cnt_pm1h")
+    dep_pm2h   = _f("muc_dep_cnt_pm2h")
+    arr_pm2h   = _f("muc_arr_cnt_pm2h")
     total_pm1h = dep_pm1h + arr_pm1h
     total_pm2h = dep_pm2h + arr_pm2h
-    # Normalise to typical MUC rolling traffic rather than routine baseline flow.
-    congestion_score = min(total_pm1h / 120.0, 1.0) * 0.50
-    congestion_score += min(total_pm2h / 200.0, 1.0) * 0.30
+
+    # Subtract routine-traffic baseline before normalising so normal MUC
+    # traffic (~60–80 movements per 3h window) doesn't always score ~0.50.
+    # Only genuinely busy periods (>100 movements) score above ~0.43.
+    above_baseline_pm1h = max(total_pm1h - 50, 0)
+    above_baseline_pm2h = max(total_pm2h - 90, 0)
+    congestion_score  = min(above_baseline_pm1h / 70.0,  1.0) * 0.55
+    congestion_score += min(above_baseline_pm2h / 110.0, 1.0) * 0.35
     scores["ATC / Congestion"] = min(congestion_score, 1.0)
 
     # ── 5. Airline / Turnaround ───────────────────────────────────────────────
-    # Airline congestion + chronically late route = operational/turnaround issue
-    air_dep = _f("air_departure_cnt_pm1h")
-    air_arr = _f("air_arrival_cnt_pm1h")
-    route_mean  = _f("route_mean_delay_past")
-    air_mean    = _f("air_mean_delay_past")
+    air_dep    = _f("air_departure_cnt_pm1h")
+    air_arr    = _f("air_arrival_cnt_pm1h")
+    route_mean = _f("route_mean_delay_past")
+    air_mean   = _f("air_mean_delay_past")
+
     airline_score = 0.0
     airline_score += min((air_dep + air_arr) / 20.0, 1.0) * 0.20
     airline_score += min(route_mean / 20.0, 1.0)          * 0.50
     airline_score += min(air_mean   / 15.0, 1.0)          * 0.30
     scores["Airline / Turnaround"] = min(airline_score, 1.0)
+
+    # ── 6. Historical Patterns (time-of-day + chronic route delay) ───────────
+    # Munich has well-known delay patterns by UTC hour:
+    #   06–09: morning bank, reactionary from overnight positioning
+    #   09–13: midday, generally lowest delays
+    #   13–17: afternoon, congestion builds
+    #   17–21: evening bank, turnaround delays accumulate
+    # Used as a proxy when route/airline historical averages are unavailable
+    # (common for live flights without sufficient historical rotation data).
+    hist_score = 0.0
+    sched_hour = _f("sched_hour_utc", default=-1)   # integer 0–23 UTC
+
+    if route_mean > 2:
+        hist_score += min(route_mean / 25.0, 1.0) * 0.60
+    if air_mean > 2:
+        hist_score += min(air_mean / 20.0, 1.0) * 0.30
+
+    if 6 <= sched_hour < 9:
+        hist_score += 0.30   # morning bank
+    elif 17 <= sched_hour < 21:
+        hist_score += 0.20   # evening bank
+    elif 13 <= sched_hour < 17:
+        hist_score += 0.10   # afternoon build-up
+
+    scores["Historical Patterns"] = min(hist_score, 1.0)
 
     return scores
 
